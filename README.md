@@ -31,35 +31,61 @@ pip install torch transformers peft trl datasets
 pip install langchain langchain-community langchain-huggingface
 pip install faiss-cpu rank_bm25 jieba pandas
 pip install openai gradio matplotlib tqdm
+```
 
 ## 使用指南
-1. 构建 RAG 知识库
-将原始 API 数据放置在 ../data/raw_api_bank/all_apis.csv。然后运行以下命令构建检索索引：
+
+### 1. 构建 RAG 知识库
+
+将原始 API 数据放置在 `../data/raw_api_bank/all_apis.csv`。然后运行以下命令构建检索索引：
+
 ```bash
 python step1_build_rag.py
-可以通过运行 python test_RAG.py 来验证检索系统的准确性。
+```
 
-2. 合成训练数据
+可以通过运行 `python test_RAG.py` 来验证检索系统的准确性。
+
+### 2. 合成训练数据
+
 在调用外部 API 生成数据前，请先配置环境变量。以阿里云 DashScope 为例：
+
 ```bash
 export DASHSCOPE_API_KEY="在这里填入你真实的_API_KEY"
 python step2_make_data.py
+```
 
-执行完毕后，会在 ../data 目录下生成 grpo_train.json 和 grpo_test.json。
+执行完毕后，会在 `../data` 目录下生成 `grpo_train.json` 和 `grpo_test.json`。
 
-3. 训练智能体
+### 3. 训练智能体
+
 启动 GRPO 强化学习流程。该脚本默认配置为 4-bit QLoRA 以优化显存占用：
-python step4_train.py
-训练完成后的 LoRA 权重将保存在 ../outputs/grpo_agent_final 目录。
 
-4. 推理与交互
+```bash
+python step4_train.py
+```
+
+训练完成后的 LoRA 权重将保存在 `../outputs/grpo_agent_final` 目录。
+
+### 4. 推理与交互
+
 你可以通过命令行或 Web 界面与训练好的智能体进行交互：
+
 命令行模式：
+
+```bash
 python step5_inference.py
+```
 
 Web UI 模式 (Gradio)：
-python step6_web_ui.py
 
-5. 评估模型
+```bash
+python step6_web_ui.py
+```
+
+### 5. 评估模型
+
 运行综合评估脚本，获取路由准确率、OOD 拒答率和参数提取等详细指标报告：
+
+```bash
 python step7_evaluate.py
+```
