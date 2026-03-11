@@ -32,16 +32,19 @@ pip install langchain langchain-community langchain-huggingface
 pip install faiss-cpu rank_bm25 jieba pandas
 pip install openai gradio matplotlib tqdm
 
-使用指南
+## 使用指南
 1. 构建 RAG 知识库
 将原始 API 数据放置在 ../data/raw_api_bank/all_apis.csv。然后运行以下命令构建检索索引：
+```bash
 python step1_build_rag.py
 可以通过运行 python test_RAG.py 来验证检索系统的准确性。
 
 2. 合成训练数据
 在调用外部 API 生成数据前，请先配置环境变量。以阿里云 DashScope 为例：
+```bash
 export DASHSCOPE_API_KEY="在这里填入你真实的_API_KEY"
 python step2_make_data.py
+
 执行完毕后，会在 ../data 目录下生成 grpo_train.json 和 grpo_test.json。
 
 3. 训练智能体
