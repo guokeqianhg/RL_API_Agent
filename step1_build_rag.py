@@ -1,8 +1,15 @@
+import os
+# 设置 Hugging Face 国内镜像，防止下载模型时网络中断
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import ast
 import json
 import pickle
 import re
 from pathlib import Path
+
+import torch
+from sentence_transformers import CrossEncoder
 
 import pandas as pd
 from rank_bm25 import BM25Okapi
@@ -23,28 +30,20 @@ except ImportError:
 
 class APIMemoryBank:
     """
-    基于 LangChain + FAISS + BM25 + RRF 的 API 检索库
-
-    兼容下游接口：
-    - build_real_api_bank()
-    - load_bank()
-    - retrieve_raw()
-    - retrieve_with_fallback()
-    - api_schemas
+    基于 LangChain + FAISS + BM25 + RRF + CrossEncoder 重排的 API 检索库
     """
 
     def __init__(
         self,
         model_name: str = "BAAI/bge-small-zh-v1.5",
-        retrieval_k: int = 18,
+        retrieval_k: int = 40,
         candidate_pool_k: int = 5,
-        rrf_k: int = 60,
-        dense_weight: float = 0.55,
-        sparse_weight: float = 0.45,
+        rrf_k: int = 15,
+        dense_weight: float = 0.65,
+        sparse_weight: float = 0.35,
     ):
         self.base_dir = Path(__file__).resolve().parent
 
-        # 改成 src/vector_db，尽量和你当前从 src 目录运行 step3 的方式保持一致
         self.vector_dir = (self.base_dir / "../vector_db").resolve()
         self.default_csv_path = (self.base_dir / "../data/raw_api_bank/all_apis.csv").resolve()
 
@@ -73,6 +72,16 @@ class APIMemoryBank:
             model_name=model_name,
             encode_kwargs={"normalize_embeddings": True}
         )
+        
+        # ================= [新增：初始化 Cross-Encoder 重排模型] =================
+        print("🧠 Loading Reranker model (BAAI/bge-reranker-v2-m3)...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            self.reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512, device=device)
+        except Exception as e:
+            print(f"⚠️ Reranker 加载失败: {e}。将降级使用基础双路召回。")
+            self.reranker = None
+        # =====================================================================
 
     # ----------------------------
     # 基础工具
@@ -115,16 +124,12 @@ class APIMemoryBank:
             return default
 
     def _parse_api_info(self, api_info_str: str, api_name: str):
-        """
-        安全解析 api_info，不使用 exec，增强对 JSON 风格 true/false/null 的兼容
-        """
         text = self._clean_api_info_text(api_info_str)
 
         desc_expr = self._extract_assignment_block(text, "description")
         input_expr = self._extract_assignment_block(text, "input_parameters")
         output_expr = self._extract_assignment_block(text, "output_parameters")
 
-        # 增强健壮性：将非标准 Python 布尔/空值转换为 Python 格式
         def _clean_expr(expr):
             if not expr: return expr
             expr = re.sub(r'\btrue\b', 'True', expr)
@@ -170,11 +175,6 @@ class APIMemoryBank:
         return parts
 
     def _parse_signature(self, signature_str: str):
-        """
-        解析 input_parameters 列，例如：
-        token, account
-        token: str, time: str
-        """
         signature = str(signature_str).strip()
         if not signature or signature.lower() == "nan":
             return []
@@ -196,10 +196,6 @@ class APIMemoryBank:
         return parsed
 
     def _parse_cn_param_hints(self, param_text: str):
-        """
-        解析“参数”列，例如：
-        凭证(string), 账户(string)
-        """
         text = str(param_text).strip()
         if not text or text.lower() == "nan":
             return []
@@ -233,12 +229,6 @@ class APIMemoryBank:
         return "string"
 
     def _merge_parameter_schema(self, signature_params, cn_hints, parsed_input_params):
-        """
-        参数对齐策略：
-        1. 优先保留 api_info 中已有字段
-        2. 若签名列有参数但 api_info 漏了，则补齐
-        3. required 默认以签名列为准
-        """
         properties = {}
         parsed_required = []
 
@@ -335,9 +325,6 @@ class APIMemoryBank:
         return ["处理", "执行"]
 
     def _get_concept_phrases(self, api_name: str, zh_name: str, scenario: str, description: str):
-        """
-        概念级语义补充。不是按单个 API 硬编码，而是按常见业务对象补词。
-        """
         text = " ".join([
             str(api_name).lower(),
             str(zh_name).lower(),
@@ -347,60 +334,43 @@ class APIMemoryBank:
         ])
 
         concept_map = {
-            # --- 日程与提醒 ---
             "meeting": ["会议", "开会", "对齐会", "约个会"],
             "agenda": ["日程", "安排", "行程"],
             "reminder": ["提醒", "提示", "待办提醒"],
             "alarm": ["闹钟", "计时器", "定时提醒"],
             "memo": ["备忘", "备忘录", "记事本"],
             "conflict": ["冲突", "时间重合", "撞期"],
-            
-            # --- 智能家居 ---
             "device": ["设备", "家电", "灯", "空调", "扫地机器人"],
             "scene": ["场景", "模式", "智能家居场景"],
             "switch": ["开关", "定时开关", "定时任务"],
             "smart": ["智能家居", "全屋智能"],
-
-            # --- 账户与财务 ---
             "balance": ["余额", "剩余金额", "还有多少钱"],
             "trade": ["交易", "流水", "账单", "明细"],
             "account": ["账户", "银行卡", "账户信息", "开户"],
             "transfer": ["转账", "汇款", "打钱"],
             "exchange": ["汇率", "外汇", "兑换"],
             "stock": ["股票", "股市", "股价"],
-
-            # --- 通讯与消息 ---
             "email": ["邮件", "邮箱", "发信"],
             "message": ["消息", "短信", "发信息"],
             "im": ["即时消息", "聊天消息", "发微信", "发钉钉"],
-
-            # --- 旅游出行 ---
             "ticket": ["票", "门票", "预约票", "演唱会门票", "景点门票"],
             "train": ["高铁", "火车", "车票", "动车", "买票", "改签"],
             "hotel": ["酒店", "宾馆", "住宿", "订房", "退房"],
             "weather": ["天气", "气温", "下雨", "天气预报"],
             "navigation": ["导航", "路线", "怎么去", "查路线", "公交"],
             "place": ["地点", "位置", "附近", "周边", "哪里有", "商场"],
-
-            # --- 医疗与健康管理 ---
             "health": ["健康数据", "健康记录", "体征"],
             "symptom": ["症状", "头痛", "发烧", "怎么回事", "哪里不舒服", "疾病检索"],
             "emergency": ["急救", "施救", "受伤了怎么办", "急救知识"],
             "appointment": ["挂号", "看病", "预约医生", "门诊", "取消挂号"],
             "registration": ["挂号信息", "就诊时间", "医生号"],
-
-            # --- 工作与招聘 ---
             "job": ["工作", "岗位", "找工作", "招聘", "职位", "打工", "面试"],
             "company": ["公司", "企业", "年报", "经营范围", "财报", "查公司"],
-
-            # --- 学习科研 ---
             "book": ["图书", "书籍", "看书", "找书", "小说"],
             "course": ["课程", "网课", "在线课程", "讲师", "上课"],
             "exam": ["考试", "考试时间", "期末考", "四六级"],
             "conference": ["学术会议", "人工智能会议", "顶会", "AI会议"],
             "paper": ["论文", "paper", "文献", "科研"],
-
-            # --- 信息查询与 AI 工具 ---
             "express": ["快递", "物流", "查单号", "包裹", "顺丰"],
             "movie": ["电影", "音乐", "找电影", "听歌", "找歌"],
             "song": ["歌曲", "听歌", "识别歌曲", "这是什么歌"],
@@ -415,8 +385,6 @@ class APIMemoryBank:
             "caption": ["图像描述", "看图说话", "图里有什么"],
             "speech": ["语音识别", "语音生成", "转文字", "转语音", "念出来"],
             "video": ["视频描述", "看视频", "视频里有什么"],
-
-            # --- 通用 ---
             "password": ["密码", "口令", "忘记密码", "改密码"],
             "token": ["凭证", "令牌"],
         }
@@ -426,7 +394,6 @@ class APIMemoryBank:
             if key in text:
                 matched.extend(phrases)
 
-        # 中文场景级补充
         scenario_text = str(scenario)
         if "智能家居" in scenario_text:
             matched.extend(["开灯", "关灯", "开空调", "关空调", "控制家里的设备"])
@@ -439,11 +406,9 @@ class APIMemoryBank:
         if "邮件" in scenario_text or "通讯" in scenario_text:
             matched.extend(["发个邮件", "发封邮件", "邮件通知"])
 
-        # 保留原中文名
         if zh_name and str(zh_name).lower() != "nan":
             matched.append(str(zh_name).strip())
 
-        # 去重
         dedup = []
         seen = set()
         for x in matched:
@@ -500,31 +465,23 @@ class APIMemoryBank:
         param_text: str,
         expressions: str,
     ):
-        """
-        自动生成用户风格查询文档：
-        - 不依赖每个 API 手写规则
-        - 基于动作前缀 + 概念语义 + 场景语义 自动组合
-        """
         op_phrases = self._get_operation_phrases(api_name)
         concept_phrases = self._get_concept_phrases(api_name, zh_name, scenario, description)
 
         texts = []
 
-        # 通用模板
         for op in op_phrases[:3]:
             for obj in concept_phrases[:4]:
                 texts.append(f"用户可能会说：帮我{op}{obj}")
                 texts.append(f"用户可能会说：我想{op}{obj}")
                 texts.append(f"用户可能会说：请{op}{obj}")
 
-        # 查询类额外补充
         if str(api_name).startswith("Query") or str(api_name).startswith("Search") or str(api_name).startswith("Get"):
             for obj in concept_phrases[:4]:
                 texts.append(f"用户可能会说：查一下{obj}")
                 texts.append(f"用户可能会说：帮我看下{obj}")
                 texts.append(f"用户可能会说：我想查询{obj}")
 
-        # 操作类额外补充
         if str(api_name).startswith(("Add", "Book", "Buy", "Create")):
             for obj in concept_phrases[:4]:
                 texts.append(f"用户可能会说：帮我安排{obj}")
@@ -541,18 +498,15 @@ class APIMemoryBank:
                 texts.append(f"用户可能会说：帮我取消{obj}")
                 texts.append(f"用户可能会说：帮我删除{obj}")
 
-        # 场景补充模板
         if scenario and str(scenario).lower() != "nan":
             texts.append(f"用户可能会说：我有一个和{scenario}相关的请求")
             texts.append(f"用户可能会说：帮我处理{scenario}这件事")
 
-        # 参数/表达式弱补充
         if param_text and str(param_text).lower() != "nan":
             texts.append(f"相关参数包括：{param_text}")
         if expressions and str(expressions).lower() != "nan":
             texts.append(f"相关表达形式：{expressions}")
 
-        # 针对常见概念的少量通用自然表达
         concept_blob = " ".join(concept_phrases)
         if "余额" in concept_blob:
             texts.extend([
@@ -585,7 +539,6 @@ class APIMemoryBank:
                 "用户可能会说：帮我发封邮件通知一下",
             ])
 
-        # 去重 + 限制数量
         dedup = []
         seen = set()
         for text in texts:
@@ -595,7 +548,6 @@ class APIMemoryBank:
             seen.add(t)
             dedup.append(t)
 
-        # 控制每个 API 附加文档数量，避免索引膨胀过大
         return dedup[:8]
 
     def _tokenize(self, text: str):
@@ -615,14 +567,6 @@ class APIMemoryBank:
         self.bm25 = BM25Okapi(self.tokenized_corpus)
 
     def _vector_search_scores(self, query: str):
-        """
-        只使用 similarity_search_with_score。
-        将 distance 转成相似度分数：1 / (1 + distance)
-
-        返回：
-            dense_scores: {api_name: best_score}
-            dense_rank_map: {api_name: best_rank}
-        """
         dense_scores = {}
         dense_rank_map = {}
 
@@ -644,10 +588,6 @@ class APIMemoryBank:
         return dense_scores, dense_rank_map
 
     def _bm25_scores(self, query: str):
-        """
-        基于多文档语料，聚合成 API 级别分数和排名。
-        对同一 API 取最佳文档得分。
-        """
         if self.bm25 is None:
             return {}, {}
 
@@ -666,9 +606,6 @@ class APIMemoryBank:
         return best_score_by_api, sparse_rank_map
 
     def _hybrid_rank(self, query: str, top_k: int = 3):
-        """
-        用 API 级别 RRF 融合 dense 和 sparse 排名。
-        """
         if self.vectorstore is None or self.bm25 is None:
             raise RuntimeError("RAG bank is empty. Please call build_real_api_bank() or load_bank() first.")
 
@@ -769,7 +706,6 @@ class APIMemoryBank:
             }
             self.api_schemas.append(schema)
 
-            # 主文档
             main_text = self._build_main_retrieval_text(
                 category=category,
                 scenario=scenario,
@@ -795,7 +731,6 @@ class APIMemoryBank:
                 )
             )
 
-            # 自动生成用户风格查询文档
             query_texts = self._generate_query_style_texts(
                 scenario=scenario,
                 zh_name=zh_name,
@@ -908,27 +843,52 @@ class APIMemoryBank:
 
         print("✅ RAG Database Loaded!")
 
-    def retrieve_raw(self, query: str, top_k: int = 3):
-        ranked = self._hybrid_rank(query, top_k=top_k)
-        return [item["schema"] for item in ranked[:top_k]]
-
+    # ================= [升级的核心检索接口] =================
+    
     def retrieve_debug(self, query: str, top_k: int = 5):
-        ranked = self._hybrid_rank(query, top_k=top_k)
+        """
+        全链路底层检索：宽进双路召回 -> CrossEncoder精排
+        返回完整的信息字典，供测试脚本计算排序指标。
+        """
+        # 1. 宽进：多拿候选给重排模型挑选（保证至少拿 15 个）
+        pool_k = max(15, top_k * 3)
+        ranked = self._hybrid_rank(query, top_k=pool_k)
+
+        ranked = ranked[:pool_k]  # 严格剔除 15 名开外的长尾噪声，防止污染重排！
+        
+        # 2. 精排：使用 CrossEncoder 深度打分
+        if getattr(self, "reranker", None) is not None and ranked:
+            pairs = [[query, f"API名称: {item['schema'].get('name', '')}\n描述: {item['schema'].get('description', '')}"] for item in ranked]
+            scores = self.reranker.predict(pairs)
+            
+            # 将打分存入字典，并根据打分重新排序
+            for i, item in enumerate(ranked):
+                item["rerank_score"] = float(scores[i])
+            ranked.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+
+        # 3. 截断返回
         return ranked[:top_k]
+
+    def retrieve_raw(self, query: str, top_k: int = 3):
+        """
+        基础业务检索：只返回纯净的 Schema 列表
+        """
+        ranked = self.retrieve_debug(query, top_k=top_k)
+        return [item["schema"] for item in ranked]
 
     def retrieve_with_fallback(self, query: str, top_k: int = 3):
         """
-        为了减少 step2 中的 RAG miss，这里内部扩大候选池。
-        所以即便 top_k=3，返回列表也可能多于 3 个。
+        端到端路由检索：精准重排 + 常驻兜底机制
+        (Web UI, RL 训练和测试的最终调用入口)
         """
-        pool_k = max(top_k, self.candidate_pool_k)
-        ranked = self._hybrid_rank(query, top_k=pool_k)
-        retrieved = [item["schema"] for item in ranked[:pool_k]]
+        # 第一步：获取已经过重排截断的精准 Top-K
+        retrieved = self.retrieve_raw(query, top_k=top_k)
 
+        # 第二步：常驻兜底机制（如果精排前排没有，则系统强制追加到底部）
         if not any(tool["name"] == "unsupported_request" for tool in retrieved):
             fallback_tool = self.name2schema.get("unsupported_request")
             if fallback_tool is not None:
-                retrieved.append(fallback_tool)
+                retrieved.append(fallback_tool) 
 
         return retrieved
 
